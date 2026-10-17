@@ -1,17 +1,62 @@
 
+import json
+from pathlib import Path
+
 import streamlit as st
 import joblib
 import pandas as pd
 import shap
 
-# Load the trained model
-model = joblib.load("churn_model.pkl")
+
+# --------------------------------------------------
+# Load model and saved settings
+# --------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+
+MODEL_FILE = BASE_DIR / "churn_model.pkl"
+METRICS_FILE = BASE_DIR / "model_metrics.json"
+DATA_FILE = BASE_DIR / "WA_Fn-UseC_-Telco-Customer-Churn.csv"
+
+if not MODEL_FILE.exists():
+    st.error("Model file 'churn_model.pkl' was not found.")
+    st.stop()
+
+model = joblib.load(MODEL_FILE)
+
+# Read the threshold saved by the training script.
+# Fall back to 0.35 if the metrics file is unavailable.
+threshold = 0.35
+
+if METRICS_FILE.exists():
+    try:
+        with METRICS_FILE.open("r", encoding="utf-8") as file:
+            metrics = json.load(file)
+
+        threshold = float(metrics.get("threshold", 0.35))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        st.warning(
+            "Could not read model_metrics.json. "
+            "Using the default threshold of 0.35."
+        )
+
+if not 0 < threshold < 1:
+    st.error("The saved prediction threshold must be between 0 and 1.")
+    st.stop()
 
 
-# Cache the SHAP explainer so it is not recreated for every prediction
+# --------------------------------------------------
+# Create and cache the SHAP explainer
+# --------------------------------------------------
+
 @st.cache_resource
 def load_shap_explainer():
-    data = pd.read_csv("WA_Fn-UseC_-Telco-Customer-Churn.csv")
+    if not DATA_FILE.exists():
+        raise FileNotFoundError(
+            f"Dataset file not found: {DATA_FILE.name}"
+        )
+
+    data = pd.read_csv(DATA_FILE)
 
     data["TotalCharges"] = pd.to_numeric(
         data["TotalCharges"], errors="coerce"
@@ -34,15 +79,30 @@ def load_shap_explainer():
     return explainer, preprocessor
 
 
-explainer, preprocessor = load_shap_explainer()
+try:
+    explainer, preprocessor = load_shap_explainer()
+except Exception as error:
+    st.error(f"Could not initialize the SHAP explainer: {error}")
+    st.stop()
 
 
-# Page title
+# --------------------------------------------------
+# Page
+# --------------------------------------------------
+
 st.title("Customer Churn Predictor")
 st.write("Predict whether a customer is likely to leave.")
 
+st.caption(
+    f"Prediction threshold: {threshold:.0%}. "
+    "Results are estimates, not guarantees."
+)
 
-# Collect customer information in a form
+
+# --------------------------------------------------
+# Customer input form
+# --------------------------------------------------
+
 with st.form("customer_form"):
 
     st.subheader("Customer Details")
@@ -161,10 +221,12 @@ with st.form("customer_form"):
     submitted = st.form_submit_button("Predict Churn")
 
 
-# Predict only after the form is submitted
+# --------------------------------------------------
+# Prediction and explanation
+# --------------------------------------------------
+
 if submitted:
 
-    # Build the customer input
     customer = pd.DataFrame([{
         "gender": gender,
         "SeniorCitizen": 1 if senior_citizen == "Yes" else 0,
@@ -184,18 +246,19 @@ if submitted:
         "PaperlessBilling": paperless_billing,
         "PaymentMethod": payment_method,
         "MonthlyCharges": monthly_charges,
+        # Approximation: actual total charges may differ.
         "TotalCharges": monthly_charges * tenure
     }])
 
-    # Predict churn probability
+    # Calculate churn probability for the "Yes" class.
     yes_index = list(model.classes_).index("Yes")
-    probability = model.predict_proba(customer)[0, yes_index]
+    probability = float(
+        model.predict_proba(customer)[0, yes_index]
+    )
 
-    # Apply the selected prediction threshold
-    threshold = 0.35
+    # Use the threshold loaded from model_metrics.json.
     prediction = "Yes" if probability >= threshold else "No"
 
-    # Display prediction results
     st.divider()
     st.subheader("Prediction Result")
 
@@ -203,8 +266,11 @@ if submitted:
         "Estimated churn probability",
         f"{probability:.1%}"
     )
-    st.progress(float(probability))
 
+    st.progress(probability)
+
+    # Risk bands are for display; the prediction threshold
+    # above determines the Yes/No classification.
     if probability >= 0.60:
         st.error("Churn likelihood: High")
     elif probability >= 0.35:
@@ -213,7 +279,8 @@ if submitted:
         st.success("Churn likelihood: Low")
 
     st.caption(
-        "This is a model estimate, not a guarantee of what the customer will do."
+        "This is a model estimate, not a guarantee of what "
+        "the customer will do."
     )
 
     if prediction == "Yes":
@@ -221,7 +288,10 @@ if submitted:
     else:
         st.success("This customer is predicted not to churn.")
 
-    # Explain this customer's prediction using the cached SHAP explainer
+    # --------------------------------------------------
+    # SHAP feature contributions
+    # --------------------------------------------------
+
     customer_processed = preprocessor.transform(customer)
     shap_values = explainer(customer_processed)
 
@@ -241,7 +311,6 @@ if submitted:
         ascending=False
     )
 
-    # Translate encoded feature names into readable labels
     feature_labels = {
         "num__tenure": "Customer Tenure",
         "num__TotalCharges": "Total Charges",
@@ -271,14 +340,16 @@ if submitted:
     def readable_feature(name):
         return feature_labels.get(
             name,
-            name.replace("cat__", "").replace("num__", "").replace("_", " ")
+            name.replace("cat__", "")
+                .replace("num__", "")
+                .replace("_", " ")
         )
 
-    # Display the top five feature contributions
     st.divider()
     st.subheader("What Influenced This Prediction?")
 
     top_features = contributions.head(5).copy()
+
     top_features["Feature"] = top_features["Feature"].map(
         readable_feature
     )
@@ -301,16 +372,15 @@ if submitted:
             ["Customer Feature", "Contribution", "Direction"]
         ],
         hide_index=True,
-        width="stretch"
+        use_container_width=True
     )
 
     st.caption(
-        "Positive contributions push the model's raw score toward churn; "
-        "negative contributions push it away. These are not direct "
-        "percentage-point changes in churn probability."
+        "Positive contributions push the model's raw score toward "
+        "churn; negative contributions push it away. SHAP values "
+        "are not direct percentage-point changes in probability."
     )
 
-    # Display a bar chart of the ten strongest contributions
     st.write("### Contribution Strength")
 
     chart_features = contributions.head(10).copy()
@@ -321,7 +391,10 @@ if submitted:
     chart_data = chart_features.set_index("Feature")[["SHAP value"]]
     st.bar_chart(chart_data)
 
-    # General insights based on patterns in the dataset
+    # --------------------------------------------------
+    # Dataset-based insights
+    # --------------------------------------------------
+
     st.divider()
     st.subheader("Customer Insights")
 
@@ -333,15 +406,15 @@ if submitted:
         )
     elif contract == "One year":
         st.write(
-            "This customer has a one-year contract. "
-            "Customers with one-year contracts had lower churn "
-            "rates than month-to-month customers in our dataset."
+            "This customer has a one-year contract. Customers "
+            "with one-year contracts had lower churn rates than "
+            "month-to-month customers in our dataset."
         )
     else:
         st.write(
-            "This customer has a two-year contract. "
-            "Customers with two-year contracts had the lowest "
-            "churn rate among the contract types in our dataset."
+            "This customer has a two-year contract. Customers "
+            "with two-year contracts had the lowest churn rate "
+            "among the contract types in our dataset."
         )
 
     if tenure <= 12:
@@ -357,10 +430,17 @@ if submitted:
             "churn in our dataset."
         )
 
+    # --------------------------------------------------
     # Customer summary
+    # --------------------------------------------------
+
     st.divider()
     st.subheader("Customer Summary")
 
     st.write(f"**Contract type:** {contract}")
     st.write(f"**Customer tenure:** {tenure} months")
     st.write(f"**Monthly charges:** ₹{monthly_charges:.2f}")
+    st.write(
+        f"**Estimated total charges:** "
+        f"₹{monthly_charges * tenure:.2f}"
+    )
