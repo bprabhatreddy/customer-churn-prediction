@@ -113,3 +113,12 @@ The application displays feature contributions in a table and chart. These expla
 - Evaluate different classification thresholds based on business costs.
 - Improve input validation and handling of missing or inconsistent customer information.
 - Expand monitoring and evaluation for real-world predictions.
+
+
+## Screenshots
+
+### Churn Prediction Result
+![Churn prediction result](screenshots/prediction-result.png)
+
+### SHAP Explanations and Customer Insights
+![SHAP explanations and customer insights](screenshots/shap-explanation.png)
